@@ -1,0 +1,537 @@
+# -*- coding: utf-8 -*-
+"""
+01-build_channel.FCMacro — UnderDeskCableTray
+
+Builds UnderDeskCableTray.FCStd per plan.md v3 (approved 2026-10-22):
+
+  Body `Channel`  (the product, PartDesign)
+    ProfileSketch on YZ_Plane  — one closed outline: guide lip, screw zone, roof,
+                                 outer wall, floor, inner lip. Corner rounds are drawn
+                                 IN the sketch (radius-bound arcs), not as Fillet
+                                 features, so there is no edge-name (TNP) dependency.
+    ChannelPad                 — Midplane, Length = ChannelLength
+    RoofUnderside              — datum plane, XY_Plane offset -RoofThickness
+    ScrewSketch -> ScrewHole   — #8 clearance + 82 deg countersink on the underside
+    ScrewPattern               — LinearPattern along X, ScrewCount occurrences
+    LogoText -> LogoEmboss     — "CornerCAD" on the outer wall's outer face
+
+  `PrintFeet`  (Part::MultiFuse — designed-in breakaway supports, print pose only)
+    Four tapered fins at the X = -ChannelLength/2 end, SupportGap off the part, each
+    joined to the part by a FootNeckWidth x FootNeckHeight neck.
+
+Every dimension is bound to <<Params>>#VarSet.*. Sketch geometry is dimensioned only
+from each sketch's own origin/axes — no projected external geometry.
+
+NOT idempotent by design: refuses to run if UnderDeskCableTray already has a `Channel`
+body (never overwrites a model). Does NOT save the model — review, then save by hand
+(PROJECT_BOOTSTRAP.md Step 6). The one exception: a brand-new document is saved ONCE,
+EMPTY, before any geometry, because FreeCAD refuses cross-document expressions on an
+unsaved document. Requires Params.FCStd (run 00-create_params first).
+
+Run: Macro -> Macros... -> 01-build_channel -> Execute
+"""
+
+import math
+import os
+
+import FreeCAD as App
+import Part
+import Sketcher
+
+V = App.Vector
+
+PROJECT = os.environ.get("UDCT_PROJECT") or os.path.expanduser(
+    "~/Documents/3dPrinting/Commercial License/UnderDeskCableTray")
+PARAMS_PATH = os.path.join(PROJECT, "Params.FCStd")
+DOC_NAME = "UnderDeskCableTray"
+P = "<<Params>>#VarSet."
+
+FONT_CANDIDATES = [
+    "/Users/bradleycorner/Library/Fonts/DejaVuSans.ttf",
+    "/Library/Fonts/DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+]
+
+ROOT = -1     # sketch root point / H axis geo id
+H_AXIS = -1
+V_AXIS = -2
+
+
+def E(expr):
+    """Prefix every bare Param name in expr with the canonical cross-doc form."""
+    out = expr
+    for name in sorted(PARAM_NAMES, key=len, reverse=True):
+        out = _sub_word(out, name, P + name)
+    return out
+
+
+def _sub_word(s, word, repl):
+    import re
+    return re.sub(r"(?<![\w.#])" + word + r"(?!\w)", repl, s)
+
+
+PARAM_NAMES = [
+    "ChannelLength", "PocketWidth", "PocketHeight", "EntryGap", "WallThickness",
+    "FloorThickness", "RoofThickness", "ScrewZoneWidth", "ScrewCount", "ScrewEndInset",
+    "CountersinkDia", "CountersinkAngle", "GuideLipHeight", "GuideLipThickness",
+    "EntryLipRadius", "EdgeBreakRadius", "FootReach", "FootHeight", "FootThickness",
+    "FootNeckWidth", "FootNeckHeight", "TextString", "TextSize", "TextDepth",
+    "ScrewClearanceDia", "SupportGap",
+]
+
+
+# ---------------------------------------------------------------------------
+# Documents
+# ---------------------------------------------------------------------------
+def params_doc():
+    for d in App.listDocuments().values():
+        if d.Name == "Params":
+            return d
+    if not os.path.exists(PARAMS_PATH):
+        raise RuntimeError("Params.FCStd not found — run 00-create_params first: " + PARAMS_PATH)
+    return App.openDocument(PARAMS_PATH)
+
+
+def target_doc():
+    for d in App.listDocuments().values():
+        if d.Name == DOC_NAME:
+            if d.getObject("Channel"):
+                raise RuntimeError(
+                    "UnderDeskCableTray already has a Channel body — refusing to overwrite.")
+            return d
+    path = os.path.join(PROJECT, DOC_NAME + ".FCStd")
+    if os.path.exists(path):
+        d = App.openDocument(path)
+        if d.getObject("Channel"):
+            raise RuntimeError(
+                "UnderDeskCableTray.FCStd already has a Channel body — refusing to overwrite.")
+        return d
+    d = App.newDocument(DOC_NAME)
+    # Cross-document expressions (<<Params>>#VarSet.*) require the owner document to
+    # have a file path, so the NEW, EMPTY document is saved once here, before any
+    # geometry exists. The built model itself is never saved by this macro.
+    d.saveAs(path)
+    return d
+
+
+# ---------------------------------------------------------------------------
+# Sketch helpers
+# ---------------------------------------------------------------------------
+def bind(sk, idx, expr):
+    sk.setExpression("Constraints[%d]" % idx, E(expr))
+
+
+def add_pos(sk, geo, pos, axis, value, mag_expr):
+    """Pin one coordinate of a point relative to the sketch root.
+
+    axis 'x' or 'y'; value is the current signed coordinate; mag_expr is the
+    (positive) magnitude expression. Zero coordinates use PointOnObject on the axis
+    so no literal 0 dimension exists."""
+    if abs(value) < 1e-9:
+        sk.addConstraint(Sketcher.Constraint(
+            "PointOnObject", geo, pos, V_AXIS if axis == "x" else H_AXIS))
+        return
+    ctype = "DistanceX" if axis == "x" else "DistanceY"
+    if value > 0:
+        i = sk.addConstraint(Sketcher.Constraint(ctype, ROOT, 1, geo, pos, abs(value)))
+    else:
+        i = sk.addConstraint(Sketcher.Constraint(ctype, geo, pos, ROOT, 1, abs(value)))
+    bind(sk, i, mag_expr)
+
+
+def ang(v):
+    return math.atan2(v.y, v.x)
+
+
+def build_rounded_polygon(sk, pts, line_pos, radii, full_round=None):
+    """Closed axis-aligned polygon with optional radius-bound corner arcs.
+
+    pts       list of (V, ...) corner points P0..Pn-1 (numeric, current values)
+    line_pos  per line i (Pi -> Pi+1): (axis, value, magnitude-expr) where axis is
+              'x' for a vertical line (its x is pinned) or 'y' for a horizontal one
+    radii     {corner index: radius-expr}; radius value read from RADIUS_VAL
+    full_round  optional (line index, apex-magnitude-expr): that horizontal line is
+              replaced by a semicircle tangent to its two neighbouring vertical lines.
+              Its radius is set by the neighbours' spacing (no radius dimension, so it
+              can never degenerate); its apex is pinned at the line's original height.
+    """
+    n = len(pts)
+    dirs = []
+    for i in range(n):
+        d = pts[(i + 1) % n] - pts[i]
+        dirs.append(d.normalize())
+
+    # trimmed endpoints of each line
+    starts = [V(p) for p in pts]
+    ends = [V(pts[(i + 1) % n]) for i in range(n)]
+    for k, rexpr in radii.items():
+        r = RADIUS_VAL[rexpr]
+        d_in, d_out = dirs[(k - 1) % n], dirs[k]
+        ends[(k - 1) % n] = pts[k] - d_in * r
+        starts[k] = pts[k] + d_out * r
+
+    fr = full_round[0] if full_round else None
+    if fr is not None:
+        r_fr = (pts[(fr + 1) % n] - pts[fr]).Length / 2
+        ends[(fr - 1) % n] = pts[fr] - dirs[(fr - 1) % n] * r_fr
+        starts[(fr + 1) % n] = pts[(fr + 1) % n] + dirs[(fr + 1) % n] * r_fr
+
+    line_ids = []
+    for i in range(n):
+        if i == fr:
+            line_ids.append(None)
+            continue
+        line_ids.append(sk.addGeometry(Part.LineSegment(starts[i], ends[i]), False))
+
+    for i, gid in enumerate(line_ids):
+        if gid is None:
+            continue
+        axis, value, mag = line_pos[i]
+        sk.addConstraint(Sketcher.Constraint("Vertical" if axis == "x" else "Horizontal", gid))
+
+    if fr is not None:
+        g_in, g_out = line_ids[(fr - 1) % n], line_ids[(fr + 1) % n]
+        a, b = ends[(fr - 1) % n], starts[(fr + 1) % n]
+        c = (a + b) * 0.5
+        up = dirs[(fr - 1) % n]                     # incoming line direction (toward apex)
+        a_a, a_b = ang(a - c), ang(b - c)
+        mid = ang(up)
+        # choose the arc orientation whose sweep passes through the apex direction
+        def sweeps(a1, a2, t):
+            a2 = a2 if a2 >= a1 else a2 + 2 * math.pi
+            t = t if t >= a1 else t + 2 * math.pi
+            return a1 <= t <= a2
+        if sweeps(a_a, a_b, mid):
+            a1, a2, pos_a, pos_b = a_a, a_b, 1, 2
+        else:
+            a1, a2, pos_a, pos_b = a_b, a_a, 2, 1
+        if a2 < a1:
+            a2 += 2 * math.pi
+        aid = sk.addGeometry(Part.ArcOfCircle(Part.Circle(c, V(0, 0, 1), r_fr), a1, a2), False)
+        sk.addConstraint(Sketcher.Constraint("Tangent", g_in, 2, aid, pos_a))
+        sk.addConstraint(Sketcher.Constraint("Tangent", aid, pos_b, g_out, 1))
+        apex = pts[fr].y
+        centre_y = apex - up.y * r_fr
+        sk.addConstraint(Sketcher.Constraint("DistanceY", aid, 3, ROOT, 1, abs(centre_y)) if centre_y < 0
+                         else Sketcher.Constraint("DistanceY", ROOT, 1, aid, 3, abs(centre_y)))
+        bind(sk, sk.ConstraintCount - 1, full_round[1])
+
+    for k in range(n):
+        if fr is not None and k in (fr, (fr + 1) % n):
+            continue                                # joined by the full round above
+        g_in, g_out = line_ids[(k - 1) % n], line_ids[k]
+        if k not in radii:
+            sk.addConstraint(Sketcher.Constraint("Coincident", g_in, 2, g_out, 1))
+            continue
+        rexpr = radii[k]
+        r = RADIUS_VAL[rexpr]
+        d_in, d_out = dirs[(k - 1) % n], dirs[k]
+        c = pts[k] - d_in * r + d_out * r
+        a_s, a_e = ang(-d_out), ang(d_in)          # start (on incoming), end (on outgoing)
+        ccw = ((-d_out).x * d_in.y - (-d_out).y * d_in.x) > 0
+        circ = Part.Circle(c, V(0, 0, 1), r)
+        if ccw:
+            a1, a2, pos_s, pos_e = a_s, a_e, 1, 2
+        else:
+            a1, a2, pos_s, pos_e = a_e, a_s, 2, 1
+        if a2 < a1:
+            a2 += 2 * math.pi
+        aid = sk.addGeometry(Part.ArcOfCircle(circ, a1, a2), False)
+        sk.addConstraint(Sketcher.Constraint("Tangent", g_in, 2, aid, pos_s))
+        sk.addConstraint(Sketcher.Constraint("Tangent", aid, pos_e, g_out, 1))
+        i = sk.addConstraint(Sketcher.Constraint("Radius", aid, r))
+        bind(sk, i, rexpr)
+
+    for i, gid in enumerate(line_ids):
+        if gid is None:
+            continue
+        axis, value, mag = line_pos[i]
+        add_pos(sk, gid, 1, axis, value, mag)
+    return line_ids
+
+
+def rectangle(sk, x0, y0, x1, y1):
+    """Axis-aligned rectangle; returns line ids [bottom, right, top, left]."""
+    p = [V(x0, y0, 0), V(x1, y0, 0), V(x1, y1, 0), V(x0, y1, 0)]
+    ids = [sk.addGeometry(Part.LineSegment(p[i], p[(i + 1) % 4]), False) for i in range(4)]
+    for i in range(4):
+        sk.addConstraint(Sketcher.Constraint("Coincident", ids[i], 2, ids[(i + 1) % 4], 1))
+    sk.addConstraint(Sketcher.Constraint("Horizontal", ids[0]))
+    sk.addConstraint(Sketcher.Constraint("Vertical", ids[1]))
+    sk.addConstraint(Sketcher.Constraint("Horizontal", ids[2]))
+    sk.addConstraint(Sketcher.Constraint("Vertical", ids[3]))
+    return ids
+
+
+def check_sketch(sk):
+    sk.recompute()
+    dof = sk.solve()
+    if dof != 0 or not sk.FullyConstrained:
+        raise RuntimeError("%s not fully constrained (solve=%s, FullyConstrained=%s)"
+                           % (sk.Label, dof, sk.FullyConstrained))
+
+
+# ---------------------------------------------------------------------------
+# Build
+# ---------------------------------------------------------------------------
+def main():
+    global RADIUS_VAL
+    pdoc = params_doc()
+    vs = pdoc.getObject("VarSet")
+    missing = [n for n in PARAM_NAMES if n not in vs.PropertiesList]
+    if missing:
+        raise RuntimeError("Params missing (re-run 00-create_params): " + ", ".join(missing))
+
+    def g(n):
+        v = getattr(vs, n)
+        return float(v.Value) if hasattr(v, "Value") else v
+
+    L, PW, PH, EG = g("ChannelLength"), g("PocketWidth"), g("PocketHeight"), g("EntryGap")
+    W, FT, RT, SZW = g("WallThickness"), g("FloorThickness"), g("RoofThickness"), g("ScrewZoneWidth")
+    GLH, GLT = g("GuideLipHeight"), g("GuideLipThickness")
+    RADIUS_VAL = {"EntryLipRadius": g("EntryLipRadius"), "EdgeBreakRadius": g("EdgeBreakRadius")}
+
+    doc = target_doc()
+
+    # ---------------- Body Channel ----------------
+    body = doc.addObject("PartDesign::Body", "Channel")
+    origin = body.Origin
+
+    def oplane(role):
+        for f in origin.OriginFeatures:
+            if f.Role == role:
+                return f
+        raise RuntimeError("origin feature not found: " + role)
+
+    # Profile (sketch local x = global Y, local y = global Z on YZ_Plane)
+    sk = body.newObject("Sketcher::SketchObject", "ProfileSketch")
+    sk.AttachmentSupport = [(oplane("YZ_Plane"), "")]
+    sk.MapMode = "FlatFace"
+
+    YE = -(SZW + PW + 2 * W)   # inner end (roof end / inner-lip outer face)
+    pts = [
+        V(GLT, GLH), V(0, GLH), V(0, 0), V(YE, 0), V(YE, -RT), V(-(SZW + W), -RT),
+        V(-(SZW + W), -(RT + PH)), V(-(SZW + W + PW), -(RT + PH)),
+        V(-(SZW + W + PW), -(RT + EG)), V(YE, -(RT + EG)), V(YE, -(RT + PH + FT)),
+        V(-SZW, -(RT + PH + FT)), V(-SZW, -RT), V(GLT, -RT),
+    ]
+    line_pos = [
+        ("y", GLH, "GuideLipHeight"),                                   # L0  lip top
+        ("x", 0.0, None),                                               # L1  lip inner face (desk edge)
+        ("y", 0.0, None),                                               # L2  roof top (desk plane)
+        ("x", YE, "ScrewZoneWidth + PocketWidth + 2 * WallThickness"),  # L3  roof inner end
+        ("y", -RT, "RoofThickness"),                                    # L4  roof underside
+        ("x", -(SZW + W), "ScrewZoneWidth + WallThickness"),            # L5  outer wall inner face
+        ("y", -(RT + PH), "RoofThickness + PocketHeight"),              # L6  floor top
+        ("x", -(SZW + W + PW), "ScrewZoneWidth + WallThickness + PocketWidth"),  # L7 inner lip inner face
+        ("y", -(RT + EG), "RoofThickness + EntryGap"),                  # L8  inner lip top
+        ("x", YE, "ScrewZoneWidth + PocketWidth + 2 * WallThickness"),  # L9  inner lip outer face
+        ("y", -(RT + PH + FT), "RoofThickness + PocketHeight + FloorThickness"),  # L10 bottom
+        ("x", -SZW, "ScrewZoneWidth"),                                  # L11 outer wall outer face
+        ("y", -RT, "RoofThickness"),                                    # L12 screw-zone underside
+        ("x", GLT, "GuideLipThickness"),                                # L13 lip outer face
+    ]
+    radii = {
+        0: "EdgeBreakRadius", 1: "EdgeBreakRadius",      # lip top corners
+        3: "EdgeBreakRadius",                            # roof top inner end
+        4: "EntryLipRadius",                             # roof underside edge at the gap
+        # inner lip top (line 8) is a FULL ROUND, radius WallThickness/2 — see below.
+        # Two separate corner radii degenerated at WallThickness 2.0 (sweep 2026-10-22).
+        10: "EdgeBreakRadius", 11: "EdgeBreakRadius",    # bottom corners
+        13: "EdgeBreakRadius",                           # lip outer bottom
+    }
+    build_rounded_polygon(sk, pts, line_pos, radii,
+                          full_round=(8, "RoofThickness + EntryGap + WallThickness / 2"))
+    check_sketch(sk)
+
+    pad = body.newObject("PartDesign::Pad", "ChannelPad")
+    pad.Profile = sk
+    pad.SideType = "Symmetric"
+    pad.setExpression("Length", E("ChannelLength"))
+    sk.Visibility = False
+    doc.recompute()
+
+    # Screw holes
+    dp = body.newObject("PartDesign::Plane", "RoofUnderside")
+    dp.AttachmentSupport = [(oplane("XY_Plane"), "")]
+    dp.MapMode = "FlatFace"
+    dp.setExpression(".AttachmentOffset.Base.z", E("-RoofThickness"))
+    dp.Visibility = False
+
+    ss = body.newObject("Sketcher::SketchObject", "ScrewSketch")
+    ss.AttachmentSupport = [(dp, "")]
+    ss.MapMode = "FlatFace"
+    sx = -(L / 2 - g("ScrewEndInset"))
+    sy = -SZW / 2
+    cid = ss.addGeometry(Part.Circle(V(sx, sy, 0), V(0, 0, 1), g("ScrewClearanceDia") / 2), False)
+    i = ss.addConstraint(Sketcher.Constraint("Diameter", cid, g("ScrewClearanceDia")))
+    bind(ss, i, "ScrewClearanceDia")
+    i = ss.addConstraint(Sketcher.Constraint("DistanceX", cid, 3, ROOT, 1, abs(sx)))
+    bind(ss, i, "ChannelLength / 2 - ScrewEndInset")
+    i = ss.addConstraint(Sketcher.Constraint("DistanceY", cid, 3, ROOT, 1, abs(sy)))
+    bind(ss, i, "ScrewZoneWidth / 2")
+    check_sketch(ss)
+
+    hole = body.newObject("PartDesign::Hole", "ScrewHole")
+    hole.Profile = ss
+    hole.Threaded = False
+    hole.DepthType = "ThroughAll"
+    hole.HoleCutType = "Countersink"
+    hole.HoleCutCustomValues = True
+    hole.setExpression("Diameter", E("ScrewClearanceDia"))
+    hole.setExpression("HoleCutDiameter", E("CountersinkDia"))
+    hole.setExpression("HoleCutCountersinkAngle", E("CountersinkAngle"))
+    hole.Reversed = True   # drill toward +Z, countersink on the roof underside
+    ss.Visibility = False
+
+    pat = body.newObject("PartDesign::LinearPattern", "ScrewPattern")
+    pat.Originals = [hole]
+    pat.Direction = (oplane("X_Axis"), [""])
+    pat.setExpression("Length", E("ChannelLength - 2 * ScrewEndInset"))
+    pat.setExpression("Occurrences", E("ScrewCount"))
+    body.Tip = pat          # the logo must build on the PATTERN, not the single hole
+    doc.recompute()
+
+    # Logo on the outer wall's outer face (Y = -ScrewZoneWidth, facing +Y)
+    import Draft
+    font = next((f for f in FONT_CANDIDATES if os.path.exists(f)), None)
+    if font is None:
+        raise RuntimeError("No DejaVuSans.ttf found; edit FONT_CANDIDATES")
+    txt = Draft.make_shapestring(String=vs.TextString, FontFile=font, Size=g("TextSize"))
+    txt.Label = "LogoText"
+    if "Justification" in txt.PropertiesList:
+        txt.Justification = "Middle-Center"
+    rot = App.Rotation(App.Matrix(-1, 0, 0, 0,
+                                  0, 0, 1, 0,
+                                  0, 1, 0, 0,
+                                  0, 0, 0, 1))
+    txt.Placement = App.Placement(V(0, -SZW, -(RT + (PH + FT) / 2)), rot)
+    txt.setExpression("String", E("TextString"))
+    txt.setExpression("Size", E("TextSize"))
+    txt.setExpression(".Placement.Base.y", E("-ScrewZoneWidth"))
+    txt.setExpression(".Placement.Base.z", E("-(RoofThickness + (PocketHeight + FloorThickness) / 2)"))
+    body.addObject(txt)
+    txt.Visibility = False
+
+    logo = body.newObject("PartDesign::Pad", "LogoEmboss")
+    logo.Profile = txt
+    if logo.BaseFeature != pat:
+        logo.BaseFeature = pat
+    logo.setExpression("Length", E("TextDepth"))
+
+    body.Tip = logo
+    doc.recompute()
+
+    # ---------------- PrintFeet (Part, print pose only) ----------------
+    X0 = -L / 2
+    gap = g("SupportGap")
+    face_exprs = {
+        # name: (plane, plane-offset value, offset expr, face value, face |expr|, sign)
+        "Lip":    ("XY", (GLH - RT) / 2, "(GuideLipHeight - RoofThickness) / 2",
+                   GLT, "GuideLipThickness", +1),
+        "Inner":  ("XY", -(RT + (PH + FT + EG) / 2), "-(RoofThickness + (PocketHeight + FloorThickness + EntryGap) / 2)",
+                   YE, "ScrewZoneWidth + PocketWidth + 2 * WallThickness", -1),
+        "Bottom": ("XZ", -(SZW + (PW + 2 * W) / 2), "-(ScrewZoneWidth + (PocketWidth + 2 * WallThickness) / 2)",
+                   -(RT + PH + FT), "RoofThickness + PocketHeight + FloorThickness", -1),
+        "Top":    ("XZ", YE / 2, "-(ScrewZoneWidth + PocketWidth + 2 * WallThickness) / 2",
+                   0.0, None, +1),
+    }
+    feet_parts = []
+    for name, (plane, off, off_expr, face, face_mag, s) in face_exprs.items():
+        r0 = face + s * gap
+        r0_mag = ("SupportGap" if face_mag is None else face_mag + " + SupportGap")
+        if plane == "XY":
+            base_rot = App.Rotation()
+            off_prop = ".Placement.Base.z"
+            base = V(0, 0, off)
+        else:   # local x -> X, local y -> Z, normal -> -Y
+            base_rot = App.Rotation(V(1, 0, 0), 90)
+            off_prop = ".Placement.Base.y"
+            base = V(0, off, 0)
+
+        for kind in ("Fin", "Neck"):
+            sk2 = doc.addObject("Sketcher::SketchObject", "Foot%s%s" % (name, kind))
+            sk2.Placement = App.Placement(base, base_rot)
+            sk2.setExpression(off_prop, E(off_expr))
+            if kind == "Fin":
+                A = V(X0, r0, 0)
+                B = V(X0, r0 + s * g("FootReach"), 0)
+                C = V(X0 + g("FootHeight"), r0, 0)
+                ab = sk2.addGeometry(Part.LineSegment(A, B), False)
+                bc = sk2.addGeometry(Part.LineSegment(B, C), False)
+                ca = sk2.addGeometry(Part.LineSegment(C, A), False)
+                sk2.addConstraint(Sketcher.Constraint("Coincident", ab, 2, bc, 1))
+                sk2.addConstraint(Sketcher.Constraint("Coincident", bc, 2, ca, 1))
+                sk2.addConstraint(Sketcher.Constraint("Coincident", ca, 2, ab, 1))
+                sk2.addConstraint(Sketcher.Constraint("Vertical", ab))
+                sk2.addConstraint(Sketcher.Constraint("Horizontal", ca))
+                add_pos(sk2, ab, 1, "x", X0, "ChannelLength / 2")
+                add_pos(sk2, ab, 1, "y", r0, r0_mag)
+                # Signed point-to-point dimensions (not unsigned Distance) so the solver
+                # can never flip a fin to the wrong side on a parameter change.
+                if s > 0:
+                    i = sk2.addConstraint(Sketcher.Constraint("DistanceY", ab, 1, ab, 2, g("FootReach")))
+                else:
+                    i = sk2.addConstraint(Sketcher.Constraint("DistanceY", ab, 2, ab, 1, g("FootReach")))
+                bind(sk2, i, "FootReach")
+                i = sk2.addConstraint(Sketcher.Constraint("DistanceX", ab, 1, ca, 1, g("FootHeight")))
+                bind(sk2, i, "FootHeight")
+                thick = "FootThickness"
+            else:
+                # The neck overlaps SupportGap into the part and FootThickness into the
+                # fin, so it FUSES with both (face-to-face contact alone fuses
+                # unreliably: the sweep split feet into separate solids at other sizes).
+                n0 = face - s * gap
+                n1 = r0 + s * g("FootThickness")
+                if face_mag is None:
+                    n0_mag = "SupportGap"
+                else:
+                    n0_mag = face_mag + " - SupportGap"
+                ids = rectangle(sk2, X0, n0, X0 + g("FootNeckHeight"), n1)
+                add_pos(sk2, ids[0], 1, "x", X0, "ChannelLength / 2")
+                add_pos(sk2, ids[0], 1, "y", n0, n0_mag)
+                # Signed point-to-point dimensions — an unsigned Distance here let the
+                # Inner neck flip to the wrong side at PocketWidth 60 (sweep, 2026-10-22).
+                i = sk2.addConstraint(Sketcher.Constraint("DistanceX", ids[0], 1, ids[0], 2, g("FootNeckHeight")))
+                bind(sk2, i, "FootNeckHeight")
+                if n1 > n0:
+                    i = sk2.addConstraint(Sketcher.Constraint("DistanceY", ids[1], 1, ids[1], 2, abs(n1 - n0)))
+                else:
+                    i = sk2.addConstraint(Sketcher.Constraint("DistanceY", ids[1], 2, ids[1], 1, abs(n1 - n0)))
+                bind(sk2, i, "2 * SupportGap + FootThickness")
+                thick = "FootNeckWidth"
+            check_sketch(sk2)
+            ext = doc.addObject("Part::Extrusion", "Foot%s%sSolid" % (name, kind))
+            ext.Base = sk2
+            ext.DirMode = "Normal"
+            ext.Solid = True
+            ext.Symmetric = True
+            ext.setExpression("LengthFwd", E(thick))
+            sk2.Visibility = False
+            feet_parts.append(ext)
+
+    feet = doc.addObject("Part::MultiFuse", "PrintFeet")
+    feet.Shapes = feet_parts
+    for f in feet_parts:
+        f.Visibility = False
+
+    doc.recompute()
+
+    # ---------------- Report ----------------
+    bad = [o.Name for o in doc.Objects if "Invalid" in o.State or "Error" in o.State]
+    ch = body.Shape
+    App.Console.PrintMessage(
+        "Channel: valid=%s solids=%d volume=%.1f mm3 bbox=%s\n"
+        % (ch.isValid(), len(ch.Solids), ch.Volume, ch.BoundBox))
+    App.Console.PrintMessage(
+        "PrintFeet: valid=%s solids=%d (expect 4)\n"
+        % (feet.Shape.isValid(), len(feet.Shape.Solids)))
+    if bad:
+        App.Console.PrintError("Objects with errors: %s\n" % bad)
+    App.Console.PrintMessage("Built. NOT saved — review, then File > Save As "
+                             + os.path.join(PROJECT, DOC_NAME + ".FCStd") + "\n")
+    return doc
+
+
+RADIUS_VAL = {}
+main()

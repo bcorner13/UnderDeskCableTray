@@ -1,0 +1,109 @@
+# -*- coding: utf-8 -*-
+"""
+00-create_params.FCMacro — UnderDeskCableTray
+
+Bootstrap macro: creates Params.FCStd (a VarSet-only document) at the project root with
+every variable listed in plan.md -> PARAMETERS.
+
+Idempotent: if Params.FCStd already exists it is opened, and only MISSING variables are
+added — existing values are never overwritten, so tuned values survive a re-run.
+
+Saving Params.FCStd is part of the approved bootstrap (PROJECT_BOOTSTRAP.md Step 2).
+No other document is created or saved by this macro.
+
+Run: Macro -> Macros... -> 00-create_params -> Execute
+"""
+
+import os
+import FreeCAD
+
+PROJECT = os.environ.get("UDCT_PROJECT") or os.path.expanduser(
+    "~/Documents/3dPrinting/Commercial License/UnderDeskCableTray")
+PARAMS_PATH = os.path.join(PROJECT, "Params.FCStd")
+PARAMS_DOC = "Params"
+VARSET = "VarSet"
+
+L = "App::PropertyLength"
+A = "App::PropertyAngle"
+I = "App::PropertyInteger"
+S = "App::PropertyString"
+
+# (name, type, default, group, doc)
+VARS = [
+    # Geometry
+    ("ChannelLength", L, 150.0, "Geometry", "Channel length along X; also the print height when printed on end."),
+    ("PocketWidth", L, 40.0, "Geometry", "Inside width of the cord pocket, outer wall to inner lip."),
+    ("PocketHeight", L, 30.0, "Geometry", "Inside height of the cord pocket, floor top to roof underside."),
+    ("EntryGap", L, 15.0, "Geometry", "Opening between the inner lip top and the roof, facing into the desk. Inner lip height = PocketHeight - EntryGap."),
+    ("WallThickness", L, 2.5, "Geometry", "Outer wall and inner lip thickness."),
+    ("FloorThickness", L, 2.5, "Geometry", "Floor thickness. Separate from WallThickness: base layers and perimeters are independent print concerns."),
+    # Mounting
+    ("RoofThickness", L, 4.0, "Mounting", "Flange/roof thickness - the screws pass through it."),
+    ("ScrewZoneWidth", L, 16.0, "Mounting", "Desk edge to the outer wall's outer face. Screws are centered in this strip, outside the pocket."),
+    ("ScrewCount", I, 2, "Mounting", "Number of mounting screws (LinearPattern occurrences)."),
+    ("ScrewEndInset", L, 25.0, "Mounting", "First and last screw centers from the channel ends."),
+    ("CountersinkDia", L, 9.0, "Mounting", "Countersink diameter on the roof underside. #8 flat head is ~8.4 mm."),
+    ("CountersinkAngle", A, 82.0, "Mounting", "Countersink angle. #8 flat head = 82 deg."),
+    # Edge guide
+    ("GuideLipHeight", L, 12.0, "EdgeGuide", "How far the guide lip rises above the desk-underside plane, against the desk edge."),
+    ("GuideLipThickness", L, 3.0, "EdgeGuide", "Guide lip thickness."),
+    # Finish
+    ("EntryLipRadius", L, 1.0, "Finish", "Round on the inner lip top and roof inner edge, where cords pass."),
+    ("EdgeBreakRadius", L, 0.8, "Finish", "Edge-break fillet on other exposed edges. Applied last in the feature tree."),
+    # Print support (designed-in breakaway feet, print pose only)
+    ("FootReach", L, 18.0, "PrintSupport", "How far each breakaway foot fin reaches out from the part on the bed."),
+    ("FootHeight", L, 20.0, "PrintSupport", "How far up the part each foot fin rises (tapers to zero)."),
+    ("FootThickness", L, 1.2, "PrintSupport", "Foot fin thickness (3 perimeters at 0.4 mm)."),
+    ("FootNeckWidth", L, 0.8, "PrintSupport", "Width of each snap-off neck bridging a foot to the part."),
+    ("FootNeckHeight", L, 2.0, "PrintSupport", "Height (up the part, from the bed) of each snap-off neck."),
+    # Branding
+    ("TextString", S, "CornerCAD", "Branding", "Text embossed on the outer wall's outer face."),
+    ("TextSize", L, 8.0, "Branding", "Emboss text size."),
+    ("TextDepth", L, 0.6, "Branding", "Emboss height off the outer wall."),
+    # Clearances - one per mating interface, never shared
+    ("ScrewClearanceDia", L, 4.6, "Clearances", "Screw <-> roof: shank clearance hole diameter (#8 wood screw)."),
+    ("SupportGap", L, 0.3, "Clearances", "Breakaway foot fin <-> part face: air gap everywhere except the necks."),
+]
+
+
+def get_params_doc():
+    for d in FreeCAD.listDocuments().values():
+        if d.Name == PARAMS_DOC or os.path.abspath(d.FileName or "") == PARAMS_PATH:
+            return d, False
+    if os.path.exists(PARAMS_PATH):
+        return FreeCAD.openDocument(PARAMS_PATH), False
+    return FreeCAD.newDocument(PARAMS_DOC), True
+
+
+def main():
+    if not os.path.isdir(PROJECT):
+        raise RuntimeError("Project folder not found: " + PROJECT)
+
+    doc, created = get_params_doc()
+    vs = doc.getObject(VARSET)
+    if vs is None:
+        vs = doc.addObject("App::VarSet", VARSET)
+
+    added, kept = [], []
+    for name, ptype, default, group, tip in VARS:
+        if name in vs.PropertiesList:
+            kept.append(name)
+            continue
+        vs.addProperty(ptype, name, group, tip)
+        setattr(vs, name, default)
+        added.append(name)
+
+    doc.recompute()
+    if created:
+        doc.saveAs(PARAMS_PATH)
+    else:
+        doc.save()
+
+    FreeCAD.Console.PrintMessage(
+        "Params: {} added, {} kept (existing values untouched). Saved {}\n".format(
+            len(added), len(kept), PARAMS_PATH))
+    if added:
+        FreeCAD.Console.PrintMessage("  added: " + ", ".join(added) + "\n")
+
+
+main()
